@@ -5,12 +5,14 @@ import sys
 from ctypes import CFUNCTYPE, POINTER, c_int8
 
 import llvmlite.binding as llvm
+import simple_bf
 from llvmlite import ir
 
 int8 = ir.IntType(8)
 int32 = ir.IntType(32)
 int1 = ir.IntType(1)
 void = ir.VoidType()
+int8_ptr = int8.as_pointer()
 
 # All these initializations are required for code generation!
 llvm.initialize()
@@ -52,6 +54,7 @@ def optimize_source(s):
     ops = [x for x in ops if x is not None]
     return ops
 
+
 def create_execution_engine():
     """
     Create an ExecutionEngine suitable for JIT code generation on
@@ -64,7 +67,7 @@ def create_execution_engine():
     # And an execution engine with an empty backing module
     backing_mod = llvm.parse_assembly("")
     engine = llvm.create_mcjit_compiler(backing_mod, target_machine)
-    return engine
+    return target_machine, engine
 
 
 def compile_ir(engine, llvm_ir):
@@ -102,48 +105,42 @@ def to_llvm(ops, func, ptr, write_func, read_func):
         block_no += 1
         return b
 
-    mem = func.args[0]
-
     def parse_op(xbd, c, rep):
         if c == '>' or c == '<':
             # ptr += rep
             if c == '<':
                 rep = -rep
 
-            x = xbd.load(ptr)
-            x = xbd.add(x, int32(rep))
-            xbd.store(x, ptr)
+            p = xbd.load(ptr)
+            t = xbd.gep(p, [int32(rep)])
+            xbd.store(t, ptr)
 
         elif c == '+' or c == '-':
             # *ptr += rep
             if c == '-':
                 rep = -rep
 
-            x = xbd.load(ptr)
-            p = xbd.gep(mem, [x])
-            y = xbd.load(p)
-            y = xbd.add(y, int8(rep))
-            xbd.store(y, p)
+            p = xbd.load(ptr)
+            x = xbd.load(p)
+            x = xbd.add(x, int8(rep))
+            xbd.store(x, p)
 
         elif c == '0':
 
-            x = xbd.load(ptr)
-            p = xbd.gep(mem, [x])
+            p = xbd.load(ptr)
             xbd.store(int8(0), p)
 
         elif c == '.':
 
-            x = xbd.load(ptr)
-            p = xbd.gep(mem, [x])
-            y = xbd.load(p)
-            xbd.call(write_func, (y, int32(rep)))
+            p = xbd.load(ptr)
+            x = xbd.load(p)
+            xbd.call(write_func, (x, int32(rep)))
 
         elif c == ',':
 
-            x = xbd.load(ptr)
-            p = xbd.gep(mem, [x])
-            y = xbd.call(read_func, (int32(rep),))
-            xbd.store(y, p)
+            p = xbd.load(ptr)
+            x = xbd.call(read_func, (int32(rep),))
+            xbd.store(x, p)
 
     def parse_loop(parent, begin, end):
         assert ops[begin][0] == '[' and ops[end][0] == ']'
@@ -155,8 +152,7 @@ def to_llvm(ops, func, ptr, write_func, read_func):
         parent.branch(inb)
         inbd = ir.IRBuilder(inb)
 
-        x = inbd.load(ptr)
-        p = inbd.gep(mem, [x])
+        p = inbd.load(ptr)
         t = inbd.load(p)
         pred = inbd.icmp_signed('==', t, int8(0))
         inbd.cbranch(pred, outb, xb)
@@ -177,8 +173,10 @@ def to_llvm(ops, func, ptr, write_func, read_func):
         xbd.branch(inb)
         return ir.IRBuilder(outb)
 
+    mem = func.args[0]
     b = func.append_basic_block(name='entry')
     bd = ir.IRBuilder(b)
+    bd.store(mem, ptr)
     i = 0
     while i < len(ops):
         c, rep = ops[i]
@@ -209,14 +207,15 @@ def run_llvm(ops):
     write_func = ir.Function(module, write_fnty, name="sys_write")
     read_fnty = ir.FunctionType(int8, (int32,))
     read_func = ir.Function(module, read_fnty, name="sys_read")
-    ptr = ir.GlobalVariable(module, int32, "ptr")
+    ptr = ir.GlobalVariable(module, int8_ptr, "ptr")
     ptr.linkage = 'internal'
     to_llvm(ops, func, ptr, write_func, read_func)
 
-    engine = create_execution_engine()
+    target_machine, engine = create_execution_engine()
     print(module)
 
-    compile_ir(engine, str(module))
+    mod = compile_ir(engine, str(module))
+    print(target_machine.emit_assembly(mod))
 
     func_ptr = engine.get_function_address("foo")
     cfunc = CFUNCTYPE(c_int8, POINTER(c_int8))(func_ptr)
@@ -228,7 +227,7 @@ def main():
     with open(file_path) as fh:
         data = fh.read()
 
-    ops = optimize_source(data)
+    ops = simple_bf.optimize_source(data)
     run_llvm(ops)
 
 
